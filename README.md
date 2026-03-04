@@ -15,16 +15,16 @@ bash build.sh install   # copy to ~/Applications, enable auto-start, launch
 
 ## The Hunt
 
-Every 30 seconds, Killian scans for `tsgo` processes and evaluates each one against four kill heuristics:
+Every 30 seconds, Killian counts your `tsgo` processes and your open IDE windows (VS Code, Cursor). The math is simple: if there are more runners than windows, somebody's gotta go.
 
-| # | Heuristic | What It Means | Verdict |
-|---|-----------|---------------|---------|
+| # | Rule | What It Means | Verdict |
+|---|------|---------------|---------|
 | 1 | **Orphaned** | Parent is `launchd` (PID 1) — VS Code already left the building | Immediate kill |
-| 2 | **Parent dead** | Parent process is gone or isn't VS Code/Node | Immediate kill |
+| 2 | **Parent dead** | Parent process is gone | Immediate kill |
 | 3 | **Memory hog** | Using more than 4 GB — almost certainly a leak | Immediate kill |
-| 4 | **Excess instances** | Multiple tsgo per VS Code window — only the newest survives | Kill older duplicates |
+| 4 | **Excess runners** | More tsgo processes than IDE windows | Kill oldest until the numbers match |
 
-Legitimate processes (parent VS Code alive, under 4 GB, one per window) are left alone. Killian isn't a monster — just efficient.
+IDE windows are counted via `CGWindowListCopyWindowInfo` — no accessibility permissions, no prompts, no nonsense. One window gets one runner. The rest get the crosshair.
 
 ## Menu Bar Icons
 
