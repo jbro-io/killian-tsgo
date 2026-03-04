@@ -79,21 +79,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Recent kills
-        let recent = recentKills.suffix(5)
-        if !recent.isEmpty {
-            let header = NSMenuItem(title: "Recent Kills", action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
+        // Recent kills submenu
+        if !recentKills.isEmpty {
+            let killsMenu = NSMenu()
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss"
-            for kill in recent.reversed() {
-                let title = "  PID \(kill.pid) @ \(formatter.string(from: kill.date)) — \(kill.reason)"
+            for kill in recentKills.suffix(10).reversed() {
+                let title = "PID \(kill.pid) @ \(formatter.string(from: kill.date)) — \(kill.reason)"
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 item.isEnabled = false
-                menu.addItem(item)
+                killsMenu.addItem(item)
             }
-            menu.addItem(NSMenuItem.separator())
+            let killsItem = NSMenuItem(title: "Recent Kills (\(recentKills.count))", action: nil, keyEquivalent: "")
+            killsItem.submenu = killsMenu
+            menu.addItem(killsItem)
         }
 
         // Actions
