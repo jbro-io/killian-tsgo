@@ -1,4 +1,5 @@
 import Cocoa
+import CoreGraphics
 
 struct TsGoProcess {
     let pid: pid_t
@@ -116,7 +117,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
 
         // Stats
-        let stats = NSMenuItem(title: "Scans: \(totalScans) | Kills: \(totalKills)", action: nil, keyEquivalent: "")
+        let ideCount = countIDEWindows()
+        let stats = NSMenuItem(title: "IDE windows: \(ideCount) | Scans: \(totalScans) | Kills: \(totalKills)", action: nil, keyEquivalent: "")
         stats.isEnabled = false
         menu.addItem(stats)
 
@@ -244,16 +246,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let processes = discoverProcesses()
         lastProcesses = processes
 
-        var killed = false
+        let toKill = evaluateProcesses(processes)
 
-        for proc in processes {
-            if let reason = shouldKill(proc, allProcesses: processes) {
-                killProcess(proc, reason: reason)
-                killed = true
-            }
+        for proc in toKill {
+            killProcess(proc, reason: "auto")
         }
 
-        if killed {
+        if !toKill.isEmpty {
             showKillAnimation()
         } else {
             // Let the run animation play out briefly, then settle
@@ -264,44 +263,56 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func shouldKill(_ proc: TsGoProcess, allProcesses: [TsGoProcess]) -> String? {
-        // 1. Orphaned — adopted by launchd
-        if proc.ppid == 1 {
-            return "orphaned (ppid=1)"
-        }
+    private func evaluateProcesses(_ processes: [TsGoProcess]) -> [TsGoProcess] {
+        var toKill: [TsGoProcess] = []
 
-        // 2. Parent dead or not a VS Code / node / pnpm process
-        if kill(proc.ppid, 0) != 0 {
-            return "parent dead (ppid=\(proc.ppid))"
-        } else {
-            let parentCmd = getProcessCommand(proc.ppid)
-            if let cmd = parentCmd {
-                let lower = cmd.lowercased()
-                let isLegitParent = lower.contains("code") || lower.contains("node") ||
-                                    lower.contains("pnpm") || lower.contains("electron") ||
-                                    lower.contains("cursor")
-                if !isLegitParent {
-                    return "parent not VS Code/node (\(cmd))"
-                }
+        // Always kill: orphaned, parent dead, memory hogs
+        var survivors: [TsGoProcess] = []
+        for proc in processes {
+            if proc.ppid == 1 {
+                log("Marking PID \(proc.pid) — orphaned (ppid=1)")
+                toKill.append(proc)
+            } else if kill(proc.ppid, 0) != 0 {
+                log("Marking PID \(proc.pid) — parent dead (ppid=\(proc.ppid))")
+                toKill.append(proc)
+            } else if proc.rss > fourGB {
+                log("Marking PID \(proc.pid) — memory hog (%.1f GB)", proc.memoryGB)
+                toKill.append(proc)
+            } else {
+                survivors.append(proc)
             }
         }
 
-        // 3. Memory hog — over 4GB
-        if proc.rss > fourGB {
-            return String(format: "memory hog (%.1f GB)", proc.memoryGB)
-        }
-
-        // 4. Excess instances — more than 1 per parent
-        let siblings = allProcesses.filter { $0.ppid == proc.ppid }
-        if siblings.count > 1 {
-            // Keep the newest (highest PID), kill older duplicates
-            let maxPid = siblings.map(\.pid).max() ?? proc.pid
-            if proc.pid != maxPid {
-                return "excess instance (sibling PID \(maxPid) is newer)"
+        // Count IDE windows, kill excess tsgo processes (oldest first)
+        let ideWindows = countIDEWindows()
+        if survivors.count > ideWindows {
+            let sorted = survivors.sorted { $0.pid < $1.pid }  // oldest (lowest PID) first
+            let excess = survivors.count - max(ideWindows, 0)
+            for proc in sorted.prefix(excess) {
+                log("Marking PID \(proc.pid) — excess (%d tsgo vs %d IDE windows)", Int32(survivors.count), Int32(ideWindows))
+                toKill.append(proc)
             }
         }
 
-        return nil
+        return toKill
+    }
+
+    private func countIDEWindows() -> Int {
+        let ideNames = ["Electron", "Code", "Cursor", "Visual Studio Code"]
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return 0 }
+
+        var count = 0
+        for window in windowList {
+            guard let ownerName = window[kCGWindowOwnerName as String] as? String,
+                  let layer = window[kCGWindowLayer as String] as? Int,
+                  layer == 0 else { continue }
+            if ideNames.contains(where: { ownerName.contains($0) }) {
+                count += 1
+            }
+        }
+        return count
     }
 
     private func getProcessCommand(_ pid: pid_t) -> String? {
