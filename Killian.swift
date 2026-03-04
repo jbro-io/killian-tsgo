@@ -16,6 +16,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var scanTimer: Timer?
     private var animationTimer: Timer?
+    private var runTimer: Timer?
+    private var runFrame: Bool = false
     private var lastProcesses: [TsGoProcess] = []
     private var recentKills: [(date: Date, pid: pid_t, reason: String)] = []
     private var totalKills: Int = 0
@@ -31,18 +33,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
             button.action = #selector(handleClick(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            log("Button setup: target=\(String(describing: button.target)), action=\(String(describing: button.action))")
-        } else {
-            log("ERROR: statusItem.button is nil!")
         }
 
         log("Killian started — hunting rogue tsgo runners")
         scanAndKill()
-
-        // Verify button still has target/action after scanAndKill
-        if let button = statusItem.button {
-            log("Post-scan button check: target=\(String(describing: button.target)), action=\(String(describing: button.action))")
-        }
 
         scanTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             self?.scanAndKill()
@@ -52,12 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Click Handling
 
     @objc private func handleClick(_ sender: NSStatusBarButton) {
-        log("handleClick fired!")
-        guard let event = NSApp.currentEvent else {
-            log("handleClick: NSApp.currentEvent is nil")
-            return
-        }
-        log("handleClick: event type = \(event.type.rawValue)")
+        guard let event = NSApp.currentEvent else { return }
 
         if event.type == .rightMouseUp {
             showMenu()
@@ -67,7 +56,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showMenu() {
-        log("showMenu called")
         let menu = NSMenu()
 
         // Current runners
@@ -82,8 +70,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(header)
             for proc in processes {
                 let title = String(format: "  PID %d — %.1f GB, CPU %.0f%%, up %@", proc.pid, proc.memoryGB, proc.cpu, proc.elapsed)
-                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-                item.isEnabled = false
+                let item = NSMenuItem(title: title, action: #selector(killRunner(_:)), keyEquivalent: "")
+                item.tag = Int(proc.pid)
                 menu.addItem(item)
             }
         }
@@ -115,6 +103,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // Simulate submenu
+        let simMenu = NSMenu()
+        simMenu.addItem(NSMenuItem(title: "Scan (5s)", action: #selector(simulateScan), keyEquivalent: ""))
+        simMenu.addItem(NSMenuItem(title: "Kill Sequence", action: #selector(simulateKill), keyEquivalent: ""))
+        simMenu.addItem(NSMenuItem(title: "Fall", action: #selector(simulateFall), keyEquivalent: ""))
+        simMenu.addItem(NSMenuItem(title: "Headshot", action: #selector(simulateHeadshot), keyEquivalent: ""))
+        let simItem = NSMenuItem(title: "Simulate", action: nil, keyEquivalent: "")
+        simItem.submenu = simMenu
+        menu.addItem(simItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         // Stats
         let stats = NSMenuItem(title: "Scans: \(totalScans) | Kills: \(totalKills)", action: nil, keyEquivalent: "")
         stats.isEnabled = false
@@ -130,6 +130,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func scanNow() {
         scanAndKill()
+    }
+
+    @objc private func simulateScan() {
+        startRunAnimation()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            self?.stopRunAnimation()
+            self?.statusItem.button?.image = self?.statusBarImage("figure.run")
+        }
+    }
+
+    @objc private func simulateKill() {
+        showKillAnimation()
+    }
+
+    @objc private func simulateFall() {
+        statusItem.button?.image = statusBarImage("figure.fall")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            self?.statusItem.button?.image = self?.statusBarImage("figure.run")
+        }
+    }
+
+    @objc private func simulateHeadshot() {
+        statusItem.button?.image = skullImage()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            self?.statusItem.button?.image = self?.statusBarImage("figure.run")
+        }
+    }
+
+    @objc private func killRunner(_ sender: NSMenuItem) {
+        let pid = pid_t(sender.tag)
+        if let proc = lastProcesses.first(where: { $0.pid == pid }) {
+            killProcess(proc, reason: "manual kill")
+        } else {
+            // Process not in cache, kill by pid directly
+            log("Manual kill PID \(pid)")
+            kill(pid, SIGTERM)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) {
+                if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+            }
+            totalKills += 1
+            recentKills.append((date: Date(), pid: pid, reason: "manual kill"))
+        }
+        showKillAnimation()
     }
 
     @objc private func killAllRunners() {
@@ -194,6 +237,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scanAndKill() {
         totalScans += 1
+
+        // Start run animation during scan
+        startRunAnimation()
+
         let processes = discoverProcesses()
         lastProcesses = processes
 
@@ -209,7 +256,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if killed {
             showKillAnimation()
         } else {
-            updateIcon(processes: processes)
+            // Let the run animation play out briefly, then settle
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.stopRunAnimation()
+                self?.statusItem.button?.image = self?.statusBarImage("figure.run")
+            }
         }
     }
 
@@ -298,47 +349,78 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Icon Updates
 
-    private func updateIcon(processes: [TsGoProcess]) {
-        DispatchQueue.main.async { [weak self] in
+    private func startRunAnimation() {
+        guard runTimer == nil else { return }
+        runFrame = false
+        statusItem.button?.image = statusBarImage("figure.run")
+        runTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             guard let self = self, let button = self.statusItem.button else { return }
-            if processes.isEmpty {
-                button.image = self.statusBarImage("figure.run")
-            } else {
-                button.image = self.statusBarImage("figure.run.circle")
-            }
+            self.runFrame.toggle()
+            button.image = self.statusBarImage(self.runFrame ? "figure.walk" : "figure.run")
         }
     }
 
+    private func stopRunAnimation() {
+        runTimer?.invalidate()
+        runTimer = nil
+    }
+
     private func showKillAnimation() {
+        stopRunAnimation()
         animationTimer?.invalidate()
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let button = self.statusItem.button else { return }
 
-            // Phase 1: figure.fall for 1.5s
-            button.image = self.statusBarImage("figure.fall")
+            // Phase 1: scope (headshot) for 0.6s
+            button.image = self.statusBarImage("scope")
 
-            self.animationTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+            self.animationTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: false) { [weak self] _ in
                 guard let self = self, let button = self.statusItem.button else { return }
 
-                // Phase 2: checkmark for 1s
-                button.image = self.statusBarImage("checkmark.circle")
+                // Phase 2: figure.fall for 1s
+                button.image = self.statusBarImage("figure.fall")
 
                 self.animationTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
-                    // Phase 3: back to normal
-                    let current = self?.discoverProcesses() ?? []
-                    self?.lastProcesses = current
-                    self?.updateIcon(processes: current)
+                    guard let self = self, let button = self.statusItem.button else { return }
+
+                    // Phase 3: skull and crossbones for 1.5s
+                    button.image = self.skullImage()
+
+                    self.animationTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+                        self?.statusItem.button?.image = self?.statusBarImage("figure.run")
+                    }
                 }
             }
         }
     }
+
+    // MARK: - Image Helpers
 
     private func statusBarImage(_ name: String) -> NSImage? {
         let config = NSImage.SymbolConfiguration.preferringMonochrome()
         let img = NSImage(systemSymbolName: name, accessibilityDescription: "Killian")?
             .withSymbolConfiguration(config)
         img?.isTemplate = true
+        return img
+    }
+
+    private func skullImage() -> NSImage {
+        let size = NSSize(width: 28, height: 28)
+        let img = NSImage(size: size, flipped: false) { rect in
+            let str = "\u{2620}" as NSString  // ☠ skull and crossbones
+            let font = NSFont.systemFont(ofSize: 26, weight: .regular)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: NSColor.black
+            ]
+            let strSize = str.size(withAttributes: attrs)
+            let x = (rect.width - strSize.width) / 2
+            let y = (rect.height - strSize.height) / 2
+            str.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
+            return true
+        }
+        img.isTemplate = true
         return img
     }
 
