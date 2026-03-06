@@ -70,7 +70,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             header.isEnabled = false
             menu.addItem(header)
             for proc in processes {
-                let title = String(format: "  PID %d — %.1f GB, CPU %.0f%%, up %@", proc.pid, proc.memoryGB, proc.cpu, proc.elapsed)
+                let label = isLanguageServer(proc) ? "LSP" : "CLI"
+                let title = String(format: "  PID %d [%@] — %.1f GB, CPU %.0f%%, up %@", proc.pid, label, proc.memoryGB, proc.cpu, proc.elapsed)
                 let item = NSMenuItem(title: title, action: #selector(killRunner(_:)), keyEquivalent: "")
                 item.tag = Int(proc.pid)
                 menu.addItem(item)
@@ -267,36 +268,85 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard processes.count > 1 else { return [] }
 
         var toKill: [TsGoProcess] = []
-
-        // Always kill: orphaned, parent dead, memory hogs
         var survivors: [TsGoProcess] = []
+
         for proc in processes {
-            if proc.ppid == 1 {
-                log("Marking PID \(proc.pid) — orphaned (ppid=1)")
+            let lsp = isLanguageServer(proc)
+            let label = lsp ? "LSP" : "CLI"
+            let seconds = elapsedSeconds(proc.elapsed)
+
+            // Always kill memory hogs regardless of type
+            if proc.rss > fourGB {
+                log("Marking PID \(proc.pid) [%@] — memory hog (%.1f GB)", label, proc.memoryGB)
                 toKill.append(proc)
-            } else if kill(proc.ppid, 0) != 0 {
-                log("Marking PID \(proc.pid) — parent dead (ppid=\(proc.ppid))")
+                continue
+            }
+
+            // Grace period: skip processes younger than 60s from all other rules
+            if seconds < 60 {
+                survivors.append(proc)
+                continue
+            }
+
+            let orphaned = proc.ppid == 1 || kill(proc.ppid, 0) != 0
+
+            if orphaned && lsp {
+                // Orphaned LSP — IDE would never produce ppid=1
+                log("Marking PID \(proc.pid) [LSP] — orphaned (ppid=\(proc.ppid))")
                 toKill.append(proc)
-            } else if proc.rss > fourGB {
-                log("Marking PID \(proc.pid) — memory hog (%.1f GB)", proc.memoryGB)
-                toKill.append(proc)
+            } else if orphaned && !lsp {
+                // Orphaned CLI — only kill if idle (>5 min AND cpu <5%)
+                if seconds > 300 && proc.cpu < 5.0 {
+                    log("Marking PID \(proc.pid) [CLI] — orphaned idle (ppid=\(proc.ppid), CPU %.0f%%, up %@)", proc.cpu, proc.elapsed)
+                    toKill.append(proc)
+                } else {
+                    survivors.append(proc)
+                }
             } else {
                 survivors.append(proc)
             }
         }
 
-        // Count IDE windows, kill excess tsgo processes (oldest first)
+        // Excess heuristic: only applies to LSP survivors
+        let lspSurvivors = survivors.filter { isLanguageServer($0) }
         let ideWindows = countIDEWindows()
-        if survivors.count > ideWindows {
-            let sorted = survivors.sorted { $0.pid < $1.pid }  // oldest (lowest PID) first
-            let excess = survivors.count - max(ideWindows, 0)
+        if lspSurvivors.count > ideWindows {
+            let sorted = lspSurvivors.sorted { $0.pid < $1.pid }  // oldest (lowest PID) first
+            let excess = lspSurvivors.count - max(ideWindows, 0)
             for proc in sorted.prefix(excess) {
-                log("Marking PID \(proc.pid) — excess (%d tsgo vs %d IDE windows)", Int32(survivors.count), Int32(ideWindows))
+                log("Marking PID \(proc.pid) [LSP] — excess (%d LSPs vs %d IDE windows)", Int32(lspSurvivors.count), Int32(ideWindows))
                 toKill.append(proc)
             }
         }
 
         return toKill
+    }
+
+    private func isLanguageServer(_ proc: TsGoProcess) -> Bool {
+        if proc.command.contains("--stdio") { return true }
+        if let parentCmd = getProcessCommand(proc.ppid) {
+            let idePatterns = ["Electron", "Code Helper", "Cursor", "Visual Studio Code"]
+            if idePatterns.contains(where: { parentCmd.contains($0) }) { return true }
+        }
+        return false
+    }
+
+    /// Parse ps elapsed time (MM:SS, HH:MM:SS, D-HH:MM:SS) into total seconds
+    private func elapsedSeconds(_ elapsed: String) -> Int {
+        // Handle day prefix: "1-02:03:04" → days=1, rest="02:03:04"
+        var days = 0
+        var timePart = elapsed
+        if let dashIdx = elapsed.firstIndex(of: "-") {
+            days = Int(elapsed[elapsed.startIndex..<dashIdx]) ?? 0
+            timePart = String(elapsed[elapsed.index(after: dashIdx)...])
+        }
+
+        let parts = timePart.split(separator: ":").compactMap { Int($0) }
+        switch parts.count {
+        case 2: return days * 86400 + parts[0] * 60 + parts[1]
+        case 3: return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+        default: return days * 86400
+        }
     }
 
     private func countIDEWindows() -> Int {
@@ -339,7 +389,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Kill
 
     private func killProcess(_ proc: TsGoProcess, reason: String) {
-        log("Killing PID \(proc.pid) — \(reason) (%.1f GB, CPU %.0f%%)", proc.memoryGB, proc.cpu)
+        let label = isLanguageServer(proc) ? "LSP" : "CLI"
+        log("Killing PID \(proc.pid) [%@] — \(reason) (%.1f GB, CPU %.0f%%)", label, proc.memoryGB, proc.cpu)
 
         // SIGTERM first
         kill(proc.pid, SIGTERM)
@@ -353,7 +404,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         totalKills += 1
-        recentKills.append((date: Date(), pid: proc.pid, reason: reason))
+        recentKills.append((date: Date(), pid: proc.pid, reason: "[\(label)] \(reason)"))
         // Keep only last 20 kills
         if recentKills.count > 20 {
             recentKills.removeFirst(recentKills.count - 20)
