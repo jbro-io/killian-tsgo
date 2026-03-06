@@ -1,6 +1,11 @@
 import Cocoa
 import CoreGraphics
 
+enum ProcessKind: String {
+    case tsgo = "tsgo"
+    case nextServer = "next-server"
+}
+
 struct TsGoProcess {
     let pid: pid_t
     let ppid: pid_t
@@ -8,6 +13,7 @@ struct TsGoProcess {
     let rss: UInt64  // in KB
     let elapsed: String
     let command: String
+    let kind: ProcessKind
 
     var memoryMB: UInt64 { rss / 1024 }
     var memoryGB: Double { Double(rss) / 1024.0 / 1024.0 }
@@ -36,7 +42,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        log("Killian started — hunting rogue tsgo runners")
+        log("Killian started — hunting rogue tsgo and next-server processes")
         scanAndKill()
 
         scanTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
@@ -62,7 +68,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Current runners
         let processes = discoverProcesses()
         if processes.isEmpty {
-            let item = NSMenuItem(title: "No tsgo runners detected", action: nil, keyEquivalent: "")
+            let item = NSMenuItem(title: "No rogue processes detected", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         } else {
@@ -70,7 +76,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             header.isEnabled = false
             menu.addItem(header)
             for proc in processes {
-                let label = isLanguageServer(proc) ? "LSP" : "CLI"
+                let label = processLabel(proc)
                 let title = String(format: "  PID %d [%@] — %.1f GB, CPU %.0f%%, up %@", proc.pid, label, proc.memoryGB, proc.cpu, proc.elapsed)
                 let item = NSMenuItem(title: title, action: #selector(killRunner(_:)), keyEquivalent: "")
                 item.tag = Int(proc.pid)
@@ -214,7 +220,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         for line in lines.dropFirst() {  // skip header
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.contains("/tsgo") else { continue }
+
+            let kind: ProcessKind
+            if trimmed.contains("/tsgo") {
+                kind = .tsgo
+            } else if trimmed.contains("next-server") {
+                kind = .nextServer
+            } else {
+                continue
+            }
 
             let parts = trimmed.split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
             guard parts.count >= 6,
@@ -228,7 +242,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             processes.append(TsGoProcess(
                 pid: pid, ppid: ppid, cpu: cpu, rss: rss,
-                elapsed: elapsed, command: command
+                elapsed: elapsed, command: command, kind: kind
             ))
         }
 
@@ -264,62 +278,98 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func evaluateProcesses(_ processes: [TsGoProcess]) -> [TsGoProcess] {
-        // Only consider killing if there's more than one tsgo process
-        guard processes.count > 1 else { return [] }
+        let tsgoProcesses = processes.filter { $0.kind == .tsgo }
+        let nextProcesses = processes.filter { $0.kind == .nextServer }
 
         var toKill: [TsGoProcess] = []
         var survivors: [TsGoProcess] = []
 
-        for proc in processes {
-            let lsp = isLanguageServer(proc)
-            let label = lsp ? "LSP" : "CLI"
-            let seconds = elapsedSeconds(proc.elapsed)
+        // --- tsgo evaluation (only if more than one) ---
+        if tsgoProcesses.count > 1 {
+            for proc in tsgoProcesses {
+                let lsp = isLanguageServer(proc)
+                let label = lsp ? "LSP" : "CLI"
+                let seconds = elapsedSeconds(proc.elapsed)
 
-            // Always kill memory hogs regardless of type
-            if proc.rss > fourGB {
-                log("Marking PID \(proc.pid) [%@] — memory hog (%.1f GB)", label, proc.memoryGB)
-                toKill.append(proc)
-                continue
-            }
-
-            // Grace period: skip processes younger than 60s from all other rules
-            if seconds < 60 {
-                survivors.append(proc)
-                continue
-            }
-
-            let orphaned = proc.ppid == 1 || kill(proc.ppid, 0) != 0
-
-            if orphaned && lsp {
-                // Orphaned LSP — IDE would never produce ppid=1
-                log("Marking PID \(proc.pid) [LSP] — orphaned (ppid=\(proc.ppid))")
-                toKill.append(proc)
-            } else if orphaned && !lsp {
-                // Orphaned CLI — only kill if idle (>5 min AND cpu <5%)
-                if seconds > 300 && proc.cpu < 5.0 {
-                    log("Marking PID \(proc.pid) [CLI] — orphaned idle (ppid=\(proc.ppid), CPU %.0f%%, up %@)", proc.cpu, proc.elapsed)
+                if proc.rss > fourGB {
+                    log("Marking PID \(proc.pid) [%@] — memory hog (%.1f GB)", label, proc.memoryGB)
                     toKill.append(proc)
+                    continue
+                }
+
+                if seconds < 60 {
+                    survivors.append(proc)
+                    continue
+                }
+
+                let orphaned = proc.ppid == 1 || kill(proc.ppid, 0) != 0
+
+                if orphaned && lsp {
+                    log("Marking PID \(proc.pid) [LSP] — orphaned (ppid=\(proc.ppid))")
+                    toKill.append(proc)
+                } else if orphaned && !lsp {
+                    if seconds > 300 && proc.cpu < 5.0 {
+                        log("Marking PID \(proc.pid) [CLI] — orphaned idle (ppid=\(proc.ppid), CPU %.0f%%, up %@)", proc.cpu, proc.elapsed)
+                        toKill.append(proc)
+                    } else {
+                        survivors.append(proc)
+                    }
                 } else {
                     survivors.append(proc)
                 }
-            } else {
-                survivors.append(proc)
+            }
+
+            // Excess heuristic: only applies to tsgo LSP survivors
+            let lspSurvivors = survivors.filter { isLanguageServer($0) }
+            let ideWindows = countIDEWindows()
+            if lspSurvivors.count > ideWindows {
+                let sorted = lspSurvivors.sorted { $0.pid < $1.pid }
+                let excess = lspSurvivors.count - max(ideWindows, 0)
+                for proc in sorted.prefix(excess) {
+                    log("Marking PID \(proc.pid) [LSP] — excess (%d LSPs vs %d IDE windows)", Int32(lspSurvivors.count), Int32(ideWindows))
+                    toKill.append(proc)
+                }
             }
         }
 
-        // Excess heuristic: only applies to LSP survivors
-        let lspSurvivors = survivors.filter { isLanguageServer($0) }
-        let ideWindows = countIDEWindows()
-        if lspSurvivors.count > ideWindows {
-            let sorted = lspSurvivors.sorted { $0.pid < $1.pid }  // oldest (lowest PID) first
-            let excess = lspSurvivors.count - max(ideWindows, 0)
-            for proc in sorted.prefix(excess) {
-                log("Marking PID \(proc.pid) [LSP] — excess (%d LSPs vs %d IDE windows)", Int32(lspSurvivors.count), Int32(ideWindows))
+        // --- next-server evaluation ---
+        for proc in nextProcesses {
+            let seconds = elapsedSeconds(proc.elapsed)
+
+            // Always kill memory hogs
+            if proc.rss > fourGB {
+                log("Marking PID \(proc.pid) [next-server] — memory hog (%.1f GB)", proc.memoryGB)
+                toKill.append(proc)
+                continue
+            }
+
+            if seconds < 60 { continue }
+
+            // Orphaned next-server with no TTY is rogue
+            let orphaned = proc.ppid == 1 || kill(proc.ppid, 0) != 0
+            if orphaned {
+                log("Marking PID \(proc.pid) [next-server] — orphaned (ppid=\(proc.ppid), CPU %.0f%%, %.1f GB)", proc.cpu, proc.memoryGB)
+                toKill.append(proc)
+                continue
+            }
+
+            // Walk up the ancestor chain looking for an orphaned root (ppid=1)
+            if isAncestorOrphaned(proc.ppid) {
+                log("Marking PID \(proc.pid) [next-server] — ancestor orphaned (CPU %.0f%%, %.1f GB)", proc.cpu, proc.memoryGB)
                 toKill.append(proc)
             }
         }
 
         return toKill
+    }
+
+    private func processLabel(_ proc: TsGoProcess) -> String {
+        switch proc.kind {
+        case .tsgo:
+            return isLanguageServer(proc) ? "tsgo LSP" : "tsgo CLI"
+        case .nextServer:
+            return "next-server"
+        }
     }
 
     private func isLanguageServer(_ proc: TsGoProcess) -> Bool {
@@ -367,6 +417,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return count
     }
 
+    /// Walk up the process tree (max 10 levels) to check if any ancestor is orphaned (ppid=1)
+    private func isAncestorOrphaned(_ pid: pid_t) -> Bool {
+        var current = pid
+        for _ in 0..<10 {
+            guard current > 1, let ppid = getProcessPpid(current) else { return false }
+            if ppid == 1 { return true }
+            current = ppid
+        }
+        return false
+    }
+
+    private func getProcessPpid(_ pid: pid_t) -> pid_t? {
+        let pipe = Pipe()
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-p", "\(pid)", "-o", "ppid="]
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        return pid_t(str)
+    }
+
     private func getProcessCommand(_ pid: pid_t) -> String? {
         let pipe = Pipe()
         let task = Process()
@@ -389,17 +470,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Kill
 
     private func killProcess(_ proc: TsGoProcess, reason: String) {
-        let label = isLanguageServer(proc) ? "LSP" : "CLI"
+        let label = processLabel(proc)
         log("Killing PID \(proc.pid) [%@] — \(reason) (%.1f GB, CPU %.0f%%)", label, proc.memoryGB, proc.cpu)
 
+        // For next-server, also kill the parent process tree (next dev, pnpm dev, etc.)
+        var pidsToKill: [pid_t] = [proc.pid]
+        if proc.kind == .nextServer {
+            var parentPid = proc.ppid
+            while parentPid > 1 {
+                pidsToKill.append(parentPid)
+                if let grandparent = getProcessPpid(parentPid), grandparent > 1 {
+                    // Check if grandparent is part of the next/pnpm chain
+                    if let cmd = getProcessCommand(grandparent), cmd.contains("next") || cmd.contains("pnpm") {
+                        pidsToKill.append(grandparent)
+                        parentPid = grandparent
+                    } else {
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+            if pidsToKill.count > 1 {
+                log("Killing next-server process tree: %@", pidsToKill.map { String($0) }.joined(separator: ", "))
+            }
+        }
+
         // SIGTERM first
-        kill(proc.pid, SIGTERM)
+        for pid in pidsToKill {
+            kill(pid, SIGTERM)
+        }
 
         // Check after 2 seconds, SIGKILL if still alive
         DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            if kill(proc.pid, 0) == 0 {
-                self?.log("PID \(proc.pid) still alive after SIGTERM, sending SIGKILL")
-                kill(proc.pid, SIGKILL)
+            for pid in pidsToKill {
+                if kill(pid, 0) == 0 {
+                    self?.log("PID \(pid) still alive after SIGTERM, sending SIGKILL")
+                    kill(pid, SIGKILL)
+                }
             }
         }
 
