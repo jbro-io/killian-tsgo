@@ -263,6 +263,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func evaluateProcesses(_ processes: [TsGoProcess]) -> [TsGoProcess] {
+        // Only consider killing if there's more than one tsgo process
+        guard processes.count > 1 else { return [] }
+
         var toKill: [TsGoProcess] = []
 
         // Always kill: orphaned, parent dead, memory hogs
