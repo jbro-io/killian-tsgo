@@ -12,11 +12,43 @@ struct TsGoProcess {
     let cpu: Double
     let rss: UInt64  // in KB
     let elapsed: String
+    let elapsedSeconds: Int
+    let tty: String
+    let startTime: String
     let command: String
     let kind: ProcessKind
 
     var memoryMB: UInt64 { rss / 1024 }
     var memoryGB: Double { Double(rss) / 1024.0 / 1024.0 }
+}
+
+struct ProcessInfo {
+    let pid: pid_t
+    let ppid: pid_t
+    let tty: String
+    let startTime: String
+    let command: String
+}
+
+struct ProcessSnapshot {
+    let tracked: [TsGoProcess]
+    let byPid: [pid_t: ProcessInfo]
+}
+
+struct ProcessIdentity: Hashable {
+    let pid: pid_t
+    let startTime: String
+}
+
+struct CandidateState {
+    let process: TsGoProcess
+    let reason: String
+    let consecutiveScans: Int
+}
+
+struct KillCandidate {
+    let process: TsGoProcess
+    let reason: String
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -26,11 +58,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var runTimer: Timer?
     private var runFrame: Bool = false
     private var lastProcesses: [TsGoProcess] = []
+    private var lastSnapshot: ProcessSnapshot?
     private var recentKills: [(date: Date, pid: pid_t, reason: String)] = []
+    private var suspectStates: [ProcessIdentity: CandidateState] = [:]
     private var totalKills: Int = 0
     private var totalScans: Int = 0
     private let logPath = NSHomeDirectory() + "/Library/Logs/Killian.log"
-    private let fourGB: UInt64 = 4 * 1024 * 1024  // 4GB in KB
+    private let staleTsgoGracePeriod: Int = 180
+    private let staleNextServerGracePeriod: Int = 180
+    private let staleTsgoIdleCPUThreshold: Double = 5.0
+    private let staleNextServerIdleCPUThreshold: Double = 3.0
+    private let requiredStaleScans: Int = 3
+    private let confirmedStaleMemoryBudgetKB: UInt64 = 6 * 1024 * 1024
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -42,7 +81,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        log("Killian started — hunting rogue tsgo and next-server processes")
+        log("Killian started — hunting lingering tsgo language servers and orphaned next-server processes")
         scanAndKill()
 
         scanTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
@@ -66,7 +105,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         // Current runners
-        let processes = discoverProcesses()
+        let snapshot = discoverSnapshot()
+        let processes = snapshot.tracked
+        lastProcesses = processes
+        lastSnapshot = snapshot
         if processes.isEmpty {
             let item = NSMenuItem(title: "No rogue processes detected", action: nil, keyEquivalent: "")
             item.isEnabled = false
@@ -184,7 +226,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func killAllRunners() {
-        let processes = discoverProcesses()
+        let snapshot = discoverSnapshot()
+        let processes = snapshot.tracked
+        lastProcesses = processes
+        lastSnapshot = snapshot
         for proc in processes {
             killProcess(proc, reason: "manual kill-all")
         }
@@ -195,11 +240,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Process Discovery
 
-    private func discoverProcesses() -> [TsGoProcess] {
+    private func discoverSnapshot() -> ProcessSnapshot {
         let pipe = Pipe()
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-eo", "pid,ppid,pcpu,rss,etime,command"]
+        task.arguments = ["-axo", "pid=,ppid=,pcpu=,rss=,etime=,etimes=,tty=,lstart=,command="]
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
 
@@ -207,46 +252,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try task.run()
         } catch {
             log("Failed to run ps: \(error)")
-            return []
+            return ProcessSnapshot(tracked: [], byPid: [:])
         }
 
         // Read BEFORE waitUntilExit to avoid pipe deadlock
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
+        guard let output = String(data: data, encoding: .utf8) else {
+            return ProcessSnapshot(tracked: [], byPid: [:])
+        }
 
         var processes: [TsGoProcess] = []
-        let lines = output.components(separatedBy: "\n")
+        var byPid: [pid_t: ProcessInfo] = [:]
 
-        for line in lines.dropFirst() {  // skip header
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+
+            let parts = trimmed.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 13,
+                  let pid = pid_t(parts[0]),
+                  let ppid = pid_t(parts[1]),
+                  let cpu = Double(parts[2]),
+                  let rss = UInt64(parts[3]),
+                  let elapsedSeconds = Int(parts[5]) else { continue }
+
+            let elapsed = String(parts[4])
+            let tty = String(parts[6])
+            let startTime = parts[7...11].joined(separator: " ")
+            let command = parts[12...].joined(separator: " ")
+
+            byPid[pid] = ProcessInfo(
+                pid: pid,
+                ppid: ppid,
+                tty: tty,
+                startTime: startTime,
+                command: command
+            )
 
             let kind: ProcessKind
-            if trimmed.contains("/tsgo") {
+            if command.contains("/tsgo") {
                 kind = .tsgo
-            } else if trimmed.contains("next-server") {
+            } else if command.contains("next-server") {
                 kind = .nextServer
             } else {
                 continue
             }
 
-            let parts = trimmed.split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
-            guard parts.count >= 6,
-                  let pid = pid_t(parts[0]),
-                  let ppid = pid_t(parts[1]),
-                  let cpu = Double(parts[2]),
-                  let rss = UInt64(parts[3]) else { continue }
-
-            let elapsed = String(parts[4])
-            let command = String(parts[5])
-
             processes.append(TsGoProcess(
                 pid: pid, ppid: ppid, cpu: cpu, rss: rss,
-                elapsed: elapsed, command: command, kind: kind
+                elapsed: elapsed, elapsedSeconds: elapsedSeconds,
+                tty: tty, startTime: startTime, command: command, kind: kind
             ))
         }
 
-        return processes
+        return ProcessSnapshot(tracked: processes, byPid: byPid)
     }
 
     // MARK: - Scan & Kill
@@ -257,13 +317,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Start run animation during scan
         startRunAnimation()
 
-        let processes = discoverProcesses()
+        let snapshot = discoverSnapshot()
+        let processes = snapshot.tracked
         lastProcesses = processes
+        lastSnapshot = snapshot
 
-        let toKill = evaluateProcesses(processes)
+        let toKill = evaluateProcesses(in: snapshot)
 
-        for proc in toKill {
-            killProcess(proc, reason: "auto")
+        for candidate in toKill {
+            killProcess(candidate.process, reason: candidate.reason)
         }
 
         if !toKill.isEmpty {
@@ -277,125 +339,97 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func evaluateProcesses(_ processes: [TsGoProcess]) -> [TsGoProcess] {
-        let tsgoProcesses = processes.filter { $0.kind == .tsgo }
-        let nextProcesses = processes.filter { $0.kind == .nextServer }
+    private func evaluateProcesses(in snapshot: ProcessSnapshot) -> [KillCandidate] {
+        var updatedStates: [ProcessIdentity: CandidateState] = [:]
+        var confirmed: [CandidateState] = []
 
-        var toKill: [TsGoProcess] = []
-        var survivors: [TsGoProcess] = []
+        for proc in snapshot.tracked {
+            guard let reason = staleReason(for: proc, in: snapshot) else { continue }
 
-        // --- tsgo evaluation (only if more than one) ---
-        if tsgoProcesses.count > 1 {
-            for proc in tsgoProcesses {
-                let lsp = isLanguageServer(proc)
-                let label = lsp ? "LSP" : "CLI"
-                let seconds = elapsedSeconds(proc.elapsed)
+            let identity = ProcessIdentity(pid: proc.pid, startTime: proc.startTime)
+            let scans = (suspectStates[identity]?.consecutiveScans ?? 0) + 1
+            let state = CandidateState(process: proc, reason: reason, consecutiveScans: scans)
+            updatedStates[identity] = state
 
-                if proc.rss > fourGB {
-                    log("Marking PID \(proc.pid) [%@] — memory hog (%.1f GB)", label, proc.memoryGB)
-                    toKill.append(proc)
-                    continue
-                }
-
-                if seconds < 60 {
-                    survivors.append(proc)
-                    continue
-                }
-
-                let orphaned = proc.ppid == 1 || kill(proc.ppid, 0) != 0
-
-                if orphaned && lsp {
-                    log("Marking PID \(proc.pid) [LSP] — orphaned (ppid=\(proc.ppid))")
-                    toKill.append(proc)
-                } else if orphaned && !lsp {
-                    if seconds > 300 && proc.cpu < 5.0 {
-                        log("Marking PID \(proc.pid) [CLI] — orphaned idle (ppid=\(proc.ppid), CPU %.0f%%, up %@)", proc.cpu, proc.elapsed)
-                        toKill.append(proc)
-                    } else {
-                        survivors.append(proc)
-                    }
-                } else {
-                    survivors.append(proc)
-                }
-            }
-
-            // Excess heuristic: only applies to tsgo LSP survivors
-            let lspSurvivors = survivors.filter { isLanguageServer($0) }
-            let ideWindows = countIDEWindows()
-            if lspSurvivors.count > ideWindows {
-                let sorted = lspSurvivors.sorted { $0.pid < $1.pid }
-                let excess = lspSurvivors.count - max(ideWindows, 0)
-                for proc in sorted.prefix(excess) {
-                    log("Marking PID \(proc.pid) [LSP] — excess (%d LSPs vs %d IDE windows)", Int32(lspSurvivors.count), Int32(ideWindows))
-                    toKill.append(proc)
-                }
+            if scans >= requiredStaleScans {
+                confirmed.append(state)
+            } else {
+                log(
+                    "Tracking suspect PID \(proc.pid) [%@] — %@ (%d/%d scans, %.1f GB, CPU %.0f%%)",
+                    processLabel(proc, snapshot: snapshot),
+                    reason,
+                    scans,
+                    requiredStaleScans,
+                    proc.memoryGB,
+                    proc.cpu
+                )
             }
         }
 
-        // --- next-server evaluation ---
-        for proc in nextProcesses {
-            let seconds = elapsedSeconds(proc.elapsed)
-
-            // Always kill memory hogs
-            if proc.rss > fourGB {
-                log("Marking PID \(proc.pid) [next-server] — memory hog (%.1f GB)", proc.memoryGB)
-                toKill.append(proc)
-                continue
-            }
-
-            if seconds < 60 { continue }
-
-            // Orphaned next-server with no TTY is rogue
-            let orphaned = proc.ppid == 1 || kill(proc.ppid, 0) != 0
-            if orphaned {
-                log("Marking PID \(proc.pid) [next-server] — orphaned (ppid=\(proc.ppid), CPU %.0f%%, %.1f GB)", proc.cpu, proc.memoryGB)
-                toKill.append(proc)
-                continue
-            }
-
-            // Walk up the ancestor chain looking for an orphaned root (ppid=1)
-            if isAncestorOrphaned(proc.ppid) {
-                log("Marking PID \(proc.pid) [next-server] — ancestor orphaned (CPU %.0f%%, %.1f GB)", proc.cpu, proc.memoryGB)
-                toKill.append(proc)
-            }
-        }
-
-        return toKill
+        suspectStates = updatedStates
+        return selectConfirmedKillCandidates(from: confirmed)
     }
 
-    private func processLabel(_ proc: TsGoProcess) -> String {
+    private func selectConfirmedKillCandidates(from confirmed: [CandidateState]) -> [KillCandidate] {
+        guard !confirmed.isEmpty else { return [] }
+
+        let totalConfirmedRSS = confirmed.reduce(0) { $0 + $1.process.rss }
+        let sorted = confirmed.sorted {
+            if $0.process.rss == $1.process.rss {
+                return $0.consecutiveScans > $1.consecutiveScans
+            }
+            return $0.process.rss > $1.process.rss
+        }
+
+        if totalConfirmedRSS > confirmedStaleMemoryBudgetKB {
+            log(
+                "Confirmed stale memory budget exceeded: %.1f GB across %d processes",
+                Double(totalConfirmedRSS) / 1024.0 / 1024.0,
+                confirmed.count
+            )
+
+            var selected: [KillCandidate] = []
+            var remainingRSS = totalConfirmedRSS
+            for state in sorted {
+                selected.append(KillCandidate(process: state.process, reason: state.reason))
+                remainingRSS -= state.process.rss
+                if remainingRSS <= confirmedStaleMemoryBudgetKB {
+                    break
+                }
+            }
+            return selected
+        }
+
+        if let first = sorted.first {
+            return [KillCandidate(process: first.process, reason: first.reason)]
+        }
+
+        return []
+    }
+
+    private func processLabel(_ proc: TsGoProcess, snapshot: ProcessSnapshot? = nil) -> String {
         switch proc.kind {
         case .tsgo:
-            return isLanguageServer(proc) ? "tsgo LSP" : "tsgo CLI"
+            return isLanguageServer(proc, snapshot: snapshot) ? "tsgo LSP" : "tsgo CLI"
         case .nextServer:
             return "next-server"
         }
     }
 
-    private func isLanguageServer(_ proc: TsGoProcess) -> Bool {
+    private func isLanguageServer(_ proc: TsGoProcess, snapshot: ProcessSnapshot? = nil) -> Bool {
         if proc.command.contains("--stdio") { return true }
-        if let parentCmd = getProcessCommand(proc.ppid) {
-            let idePatterns = ["Electron", "Code Helper", "Cursor", "Visual Studio Code"]
-            if idePatterns.contains(where: { parentCmd.contains($0) }) { return true }
+        if let snapshot = snapshot ?? lastSnapshot {
+            return hasIDEAncestor(proc.ppid, in: snapshot)
         }
         return false
     }
 
-    /// Parse ps elapsed time (MM:SS, HH:MM:SS, D-HH:MM:SS) into total seconds
-    private func elapsedSeconds(_ elapsed: String) -> Int {
-        // Handle day prefix: "1-02:03:04" → days=1, rest="02:03:04"
-        var days = 0
-        var timePart = elapsed
-        if let dashIdx = elapsed.firstIndex(of: "-") {
-            days = Int(elapsed[elapsed.startIndex..<dashIdx]) ?? 0
-            timePart = String(elapsed[elapsed.index(after: dashIdx)...])
-        }
-
-        let parts = timePart.split(separator: ":").compactMap { Int($0) }
-        switch parts.count {
-        case 2: return days * 86400 + parts[0] * 60 + parts[1]
-        case 3: return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
-        default: return days * 86400
+    private func staleReason(for proc: TsGoProcess, in snapshot: ProcessSnapshot) -> String? {
+        switch proc.kind {
+        case .tsgo:
+            return staleTsgoReason(proc, in: snapshot)
+        case .nextServer:
+            return staleNextServerReason(proc, in: snapshot)
         }
     }
 
@@ -417,15 +451,61 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return count
     }
 
-    /// Walk up the process tree (max 10 levels) to check if any ancestor is orphaned (ppid=1)
-    private func isAncestorOrphaned(_ pid: pid_t) -> Bool {
+    private func staleTsgoReason(_ proc: TsGoProcess, in snapshot: ProcessSnapshot) -> String? {
+        guard proc.command.contains("--stdio") else { return nil }
+        guard proc.elapsedSeconds >= staleTsgoGracePeriod else { return nil }
+        guard proc.cpu < staleTsgoIdleCPUThreshold else { return nil }
+        guard !hasIDEAncestor(proc.ppid, in: snapshot) else { return nil }
+
+        if proc.ppid == 1 {
+            return "orphaned language server adopted by launchd"
+        }
+
+        if !isProcessAlive(proc.ppid, in: snapshot) {
+            return "orphaned language server whose parent exited"
+        }
+
+        return nil
+    }
+
+    private func staleNextServerReason(_ proc: TsGoProcess, in snapshot: ProcessSnapshot) -> String? {
+        guard proc.elapsedSeconds >= staleNextServerGracePeriod else { return nil }
+        guard proc.cpu < staleNextServerIdleCPUThreshold else { return nil }
+        guard proc.tty == "??" || proc.tty == "?" else { return nil }
+
+        if proc.ppid == 1 {
+            return "orphaned next-server adopted by launchd"
+        }
+
+        if !isProcessAlive(proc.ppid, in: snapshot) {
+            return "orphaned next-server whose parent exited"
+        }
+
+        return nil
+    }
+
+    private func hasIDEAncestor(_ pid: pid_t, in snapshot: ProcessSnapshot) -> Bool {
         var current = pid
-        for _ in 0..<10 {
-            guard current > 1, let ppid = getProcessPpid(current) else { return false }
-            if ppid == 1 { return true }
-            current = ppid
+        for _ in 0..<12 {
+            guard current > 1 else { return false }
+            guard let info = snapshot.byPid[current] else { return false }
+            if isIDEProcessCommand(info.command) {
+                return true
+            }
+            guard info.ppid != current else { return false }
+            current = info.ppid
         }
         return false
+    }
+
+    private func isIDEProcessCommand(_ command: String) -> Bool {
+        let idePatterns = ["Electron", "Code Helper", "Cursor", "Visual Studio Code"]
+        return idePatterns.contains(where: { command.contains($0) })
+    }
+
+    private func isProcessAlive(_ pid: pid_t, in snapshot: ProcessSnapshot) -> Bool {
+        guard pid > 1 else { return false }
+        return snapshot.byPid[pid] != nil
     }
 
     private func getProcessPpid(_ pid: pid_t) -> pid_t? {
@@ -453,6 +533,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
         task.arguments = ["-p", "\(pid)", "-o", "command="]
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func getProcessStartTime(_ pid: pid_t) -> String? {
+        let pipe = Pipe()
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-p", "\(pid)", "-o", "lstart="]
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
 
@@ -496,6 +595,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        var expectedStartTimes: [pid_t: String] = [:]
+        if let snapshot = lastSnapshot {
+            for pid in pidsToKill {
+                if let startTime = snapshot.byPid[pid]?.startTime {
+                    expectedStartTimes[pid] = startTime
+                }
+            }
+        }
+        expectedStartTimes[proc.pid] = proc.startTime
+
         // SIGTERM first
         for pid in pidsToKill {
             kill(pid, SIGTERM)
@@ -505,6 +614,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [weak self] in
             for pid in pidsToKill {
                 if kill(pid, 0) == 0 {
+                    guard let expectedStartTime = expectedStartTimes[pid],
+                          let currentStartTime = self?.getProcessStartTime(pid),
+                          currentStartTime == expectedStartTime else {
+                        self?.log("Skipping SIGKILL for PID \(pid) because process identity changed")
+                        continue
+                    }
                     self?.log("PID \(pid) still alive after SIGTERM, sending SIGKILL")
                     kill(pid, SIGKILL)
                 }

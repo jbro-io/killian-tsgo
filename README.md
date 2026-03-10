@@ -2,7 +2,7 @@
 
 *"You thought you could hide in my RAM? Think again, runner."*
 
-A macOS menu bar app that hunts down rogue `tsgo` processes — the TypeScript native preview language server that VS Code spawns and sometimes forgets about. Each one devours 3-4 GB of RAM. Left unchecked, a couple of forgotten instances will eat your entire memory budget before lunch.
+A macOS menu bar app that hunts down lingering `tsgo` processes — the TypeScript native preview language server that VS Code spawns and sometimes forgets about. Each one devours 3-4 GB of RAM. Left unchecked, a couple of forgotten instances will eat your entire memory budget before lunch.
 
 Killian sits in your menu bar, scanning every 30 seconds. When he spots a rogue runner, the kill sequence plays out right in your menu bar: crosshair locks on, the runner falls, skull and crossbones. Justice served.
 
@@ -15,16 +15,18 @@ bash build.sh install   # copy to ~/Applications, enable auto-start, launch
 
 ## The Hunt
 
-Every 30 seconds, Killian counts your `tsgo` processes and your open IDE windows (VS Code, Cursor). The math is simple: if there are more runners than windows, somebody's gotta go.
+Every 30 seconds, Killian inspects `tsgo` and `next-server` processes, but it only auto-kills runners that look genuinely abandoned across multiple scans.
 
 | # | Rule | What It Means | Verdict |
 |---|------|---------------|---------|
-| 1 | **Orphaned** | Parent is `launchd` (PID 1) — VS Code already left the building | Immediate kill |
-| 2 | **Parent dead** | Parent process is gone | Immediate kill |
-| 3 | **Memory hog** | Using more than 4 GB — almost certainly a leak | Immediate kill |
-| 4 | **Excess runners** | More tsgo processes than IDE windows | Kill oldest until the numbers match |
+| 1 | **Multi-scan confirmation** | A process must look stale for 3 consecutive scans | Avoids transient false positives |
+| 2 | **Language server only for tsgo** | Auto-kill applies only to `tsgo --stdio` language-server processes | CLI builds are left alone |
+| 3 | **Grace period** | Process must survive at least 3 minutes before it is considered stale | Avoids reload/build handoff kills |
+| 4 | **Idle** | `tsgo` must stay under 5% CPU, `next-server` under 3% CPU | Active work is left alone |
+| 5 | **Confirmed orphaning** | `tsgo` must lose VS Code/Cursor ancestry and have a dead parent; `next-server` must have no TTY and a dead parent | Only abandoned runners are targeted |
+| 6 | **Memory budget** | If confirmed-stale runners exceed 6 GB combined, Killian kills the biggest offenders first | Memory leaks are drained faster |
 
-IDE windows are counted via `CGWindowListCopyWindowInfo` — no accessibility permissions, no prompts, no nonsense. One window gets one runner. The rest get the crosshair.
+Killian no longer auto-kills based on visible window counts. It also checks PID start time before escalating from `SIGTERM` to `SIGKILL`, so PID reuse does not hit the wrong process.
 
 ## Menu Bar Icons
 
