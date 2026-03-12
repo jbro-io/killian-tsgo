@@ -62,10 +62,8 @@ PLIST
 }
 
 install() {
-    if [ ! -d "$APP_BUNDLE" ]; then
-        echo "App not built yet. Building first..."
-        build
-    fi
+    echo "Building fresh app bundle for install..."
+    build
 
     echo "Installing $APP_NAME..."
 

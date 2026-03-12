@@ -244,7 +244,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let pipe = Pipe()
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-axo", "pid=,ppid=,pcpu=,rss=,etime=,etimes=,tty=,lstart=,command="]
+        task.arguments = ["-axo", "pid=,ppid=,pcpu=,rss=,etime=,tty=,lstart=,command="]
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
 
@@ -270,17 +270,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if trimmed.isEmpty { continue }
 
             let parts = trimmed.split(separator: " ", omittingEmptySubsequences: true)
-            guard parts.count >= 13,
+            guard parts.count >= 12,
                   let pid = pid_t(parts[0]),
                   let ppid = pid_t(parts[1]),
                   let cpu = Double(parts[2]),
                   let rss = UInt64(parts[3]),
-                  let elapsedSeconds = Int(parts[5]) else { continue }
+                  let elapsedSeconds = parseElapsedSeconds(String(parts[4])) else { continue }
 
             let elapsed = String(parts[4])
-            let tty = String(parts[6])
-            let startTime = parts[7...11].joined(separator: " ")
-            let command = parts[12...].joined(separator: " ")
+            let tty = String(parts[5])
+            let startTime = parts[6...10].joined(separator: " ")
+            let command = parts[11...].joined(separator: " ")
 
             byPid[pid] = ProcessInfo(
                 pid: pid,
@@ -307,6 +307,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return ProcessSnapshot(tracked: processes, byPid: byPid)
+    }
+
+    private func parseElapsedSeconds(_ elapsed: String) -> Int? {
+        let daySplit = elapsed.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+
+        let dayCount: Int
+        let timePart: Substring
+
+        if daySplit.count == 2 {
+            guard let parsedDays = Int(daySplit[0]) else { return nil }
+            dayCount = parsedDays
+            timePart = daySplit[1]
+        } else {
+            dayCount = 0
+            timePart = Substring(elapsed)
+        }
+
+        let timeComponents = timePart.split(separator: ":")
+        guard timeComponents.count == 2 || timeComponents.count == 3 else { return nil }
+
+        let hours: Int
+        let minutesIndex: Int
+        if timeComponents.count == 3 {
+            guard let parsedHours = Int(timeComponents[0]) else { return nil }
+            hours = parsedHours
+            minutesIndex = 1
+        } else {
+            hours = 0
+            minutesIndex = 0
+        }
+
+        guard let minutes = Int(timeComponents[minutesIndex]),
+              let seconds = Int(timeComponents[minutesIndex + 1]) else { return nil }
+
+        return (((dayCount * 24) + hours) * 60 + minutes) * 60 + seconds
     }
 
     // MARK: - Scan & Kill
@@ -452,20 +487,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func staleTsgoReason(_ proc: TsGoProcess, in snapshot: ProcessSnapshot) -> String? {
-        guard proc.command.contains("--stdio") else { return nil }
+        if proc.command.contains("--stdio") {
+            guard proc.elapsedSeconds >= staleTsgoGracePeriod else { return nil }
+            guard proc.cpu < staleTsgoIdleCPUThreshold else { return nil }
+            guard !hasIDEAncestor(proc.ppid, in: snapshot) else { return nil }
+
+            if proc.ppid == 1 {
+                return "orphaned language server adopted by launchd"
+            }
+
+            if !isProcessAlive(proc.ppid, in: snapshot) {
+                return "orphaned language server whose parent exited"
+            }
+
+            return nil
+        }
+
+        guard isBuildWatchTsgo(proc) else { return nil }
+        guard isInnermostTrackedTsgoProcess(proc, in: snapshot) else { return nil }
         guard proc.elapsedSeconds >= staleTsgoGracePeriod else { return nil }
-        guard proc.cpu < staleTsgoIdleCPUThreshold else { return nil }
-        guard !hasIDEAncestor(proc.ppid, in: snapshot) else { return nil }
 
-        if proc.ppid == 1 {
-            return "orphaned language server adopted by launchd"
-        }
-
-        if !isProcessAlive(proc.ppid, in: snapshot) {
-            return "orphaned language server whose parent exited"
-        }
-
-        return nil
+        return orphanedTsgoChainReason(for: proc, in: snapshot)
     }
 
     private func staleNextServerReason(_ proc: TsGoProcess, in snapshot: ProcessSnapshot) -> String? {
@@ -496,6 +538,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             current = info.ppid
         }
         return false
+    }
+
+    private func isBuildWatchTsgo(_ proc: TsGoProcess) -> Bool {
+        proc.command.contains("--build") && proc.command.contains("--watch")
+    }
+
+    private func isInnermostTrackedTsgoProcess(_ proc: TsGoProcess, in snapshot: ProcessSnapshot) -> Bool {
+        !snapshot.tracked.contains { candidate in
+            candidate.kind == .tsgo && candidate.ppid == proc.pid
+        }
+    }
+
+    private func orphanedTsgoChainReason(for proc: TsGoProcess, in snapshot: ProcessSnapshot) -> String? {
+        var currentPid = proc.pid
+
+        for _ in 0..<12 {
+            guard let info = snapshot.byPid[currentPid] else { return nil }
+
+            if info.ppid == 1 {
+                return "orphaned tsgo build watcher adopted by launchd"
+            }
+
+            guard info.ppid != currentPid else { return nil }
+            guard let parentInfo = snapshot.byPid[info.ppid] else {
+                return "orphaned tsgo build watcher whose parent exited"
+            }
+
+            if isIDEProcessCommand(parentInfo.command) {
+                return nil
+            }
+
+            guard parentInfo.command.contains("tsgo") else { return nil }
+            currentPid = parentInfo.pid
+        }
+
+        return nil
     }
 
     private func isIDEProcessCommand(_ command: String) -> Bool {
@@ -577,11 +655,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if proc.kind == .nextServer {
             var parentPid = proc.ppid
             while parentPid > 1 {
-                pidsToKill.append(parentPid)
+                appendUniquePid(parentPid, to: &pidsToKill)
                 if let grandparent = getProcessPpid(parentPid), grandparent > 1 {
                     // Check if grandparent is part of the next/pnpm chain
                     if let cmd = getProcessCommand(grandparent), cmd.contains("next") || cmd.contains("pnpm") {
-                        pidsToKill.append(grandparent)
+                        appendUniquePid(grandparent, to: &pidsToKill)
                         parentPid = grandparent
                     } else {
                         break
@@ -592,6 +670,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if pidsToKill.count > 1 {
                 log("Killing next-server process tree: %@", pidsToKill.map { String($0) }.joined(separator: ", "))
+            }
+        } else if proc.kind == .tsgo && isBuildWatchTsgo(proc) {
+            var parentPid = proc.ppid
+            while parentPid > 1 {
+                guard let parentCommand = getProcessCommand(parentPid), parentCommand.contains("tsgo") else {
+                    break
+                }
+
+                appendUniquePid(parentPid, to: &pidsToKill)
+
+                guard let grandparent = getProcessPpid(parentPid), grandparent > 1, grandparent != parentPid else {
+                    break
+                }
+                parentPid = grandparent
+            }
+
+            if pidsToKill.count > 1 {
+                log("Killing tsgo process tree: %@", pidsToKill.map { String($0) }.joined(separator: ", "))
             }
         }
 
@@ -631,6 +727,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Keep only last 20 kills
         if recentKills.count > 20 {
             recentKills.removeFirst(recentKills.count - 20)
+        }
+    }
+
+    private func appendUniquePid(_ pid: pid_t, to pids: inout [pid_t]) {
+        if !pids.contains(pid) {
+            pids.append(pid)
         }
     }
 
